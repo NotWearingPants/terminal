@@ -8,6 +8,9 @@
 #include <LibraryResources.h>
 #include <VersionHelpers.h>
 
+#include <shellapi.h>
+#include <shlwapi.h>
+
 using namespace winrt::Microsoft::Terminal;
 using namespace winrt::Microsoft::Terminal::Settings;
 using namespace winrt::Microsoft::Terminal::Settings::Model::implementation;
@@ -506,6 +509,51 @@ void CascadiaSettings::_validateMediaResources()
     }
 }
 
+static std::wstring normalizeCommandLine(_In_ LPCWSTR commandLine)
+{
+    std::wstring expandedName;
+    THROW_IF_FAILED(wil::ExpandEnvironmentStringsW(commandLine, expandedName));
+
+    int argc = 0;
+    const auto argv = CommandLineToArgvW(expandedName.c_str(), &argc);
+    THROW_LAST_ERROR_IF(!argc);
+
+    std::wstring normalized;
+
+    for (;;)
+    {
+        // CreateProcessW uses RtlGetExePath to get the lpPath for SearchPathW.
+        // The difference between the behavior of SearchPathW if lpPath is nullptr and what RtlGetExePath returns
+        // seems to be mostly whether SafeProcessSearchMode is respected and the support for relative paths.
+        // Windows Terminal makes the use relative paths rather impractical which is why we simply dropped the call to RtlGetExePath.
+        const auto status = wil::SearchPathW(nullptr, argv[0], L".exe", normalized);
+        if (status == S_OK)
+        {
+            //GetFinalPathNameByHandleW()
+            normalized = std::filesystem::canonical(normalized).native();
+            break;
+        }
+        if (status == S_OK || status != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || argc < 2)
+        {
+            break;
+        }
+
+        argv[1][-1] = L' ';
+        --argc;
+    }
+
+    if (argc != 1)
+    {
+        const auto firstArg = argv[1];
+        const auto lastArg = argv[argc - 1];
+        const auto end = lastArg + wcslen(lastArg) + 1;
+        normalized.push_back('\0');
+        normalized.append(firstArg, end);
+    }
+    
+    return normalized;
+}
+
 // Method Description:
 // - Helper to get the GUID of a profile, given an optional index and a possible
 //   "profile" value to override that.
@@ -526,9 +574,12 @@ Model::Profile CascadiaSettings::GetProfileForArgs(const Model::NewTerminalArgs&
 {
     if (newTerminalArgs)
     {
-        if (auto profile = GetProfileByName(newTerminalArgs.Profile()))
+        if (const auto name = newTerminalArgs.Profile(); !name.empty())
         {
-            return profile;
+            if (auto profile = GetProfileByName(name))
+            {
+                return profile;
+            }
         }
 
         if (const auto index = newTerminalArgs.ProfileIndex())
@@ -536,6 +587,38 @@ Model::Profile CascadiaSettings::GetProfileForArgs(const Model::NewTerminalArgs&
             if (auto profile = GetProfileByIndex(gsl::narrow<uint32_t>(index.Value())))
             {
                 return profile;
+            }
+        }
+
+        if (const auto commandline = newTerminalArgs.Commandline(); !commandline.empty())
+        {
+            std::vector<std::pair<std::wstring, Model::Profile>> haystack;
+            haystack.reserve(_allProfiles.Size());
+
+            for (const auto& profile : _allProfiles)
+            {
+                if (const auto cmd = profile.Commandline(); !cmd.empty())
+                {
+                    haystack.emplace_back(normalizeCommandLine(cmd.c_str()), profile);
+                }
+            }
+
+            const auto needle = normalizeCommandLine(commandline.c_str());
+            size_t longestPrefix = 0;
+            Model::Profile bestMatch{ nullptr };
+
+            for (const auto& [normalized, profile] : haystack)
+            {
+                if (longestPrefix < normalized.size() && til::starts_with(needle, normalized))
+                {
+                    longestPrefix = normalized.size();
+                    bestMatch = profile;
+                }
+            }
+
+            if (bestMatch)
+            {
+                return bestMatch;
             }
         }
     }

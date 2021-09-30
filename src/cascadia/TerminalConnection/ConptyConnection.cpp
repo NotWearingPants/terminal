@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
 #include "pch.h"
@@ -15,11 +15,41 @@
 #include "../../types/inc/Environment.hpp"
 #include "LibraryResources.h"
 
+#include <winternl.h>
+
 using namespace ::Microsoft::Console;
 using namespace std::string_view_literals;
 
 // Format is: "DecimalResult (HexadecimalForm)"
 static constexpr auto _errorFormat = L"{0} ({0:#010x})"sv;
+
+static winrt::hstring commandlineFromProcess(HANDLE process)
+{
+    struct PROCESS_BASIC_INFORMATION
+    {
+        NTSTATUS ExitStatus;
+        PPEB PebBaseAddress;
+        ULONG_PTR AffinityMask;
+        KPRIORITY BasePriority;
+        ULONG_PTR UniqueProcessId;
+        ULONG_PTR InheritedFromUniqueProcessId;
+    } info;
+    THROW_IF_NTSTATUS_FAILED(NtQueryInformationProcess(process, ProcessBasicInformation, &info, sizeof(info), nullptr));
+
+    PEB peb;
+    THROW_IF_WIN32_BOOL_FALSE(ReadProcessMemory(process, info.PebBaseAddress, &peb, sizeof(peb), nullptr));
+
+    RTL_USER_PROCESS_PARAMETERS params;
+    THROW_IF_WIN32_BOOL_FALSE(ReadProcessMemory(process, peb.ProcessParameters, &params, sizeof(params), nullptr));
+
+    // Yeah I know... Don't use "impl" stuff...
+    // But why do you make something _that_ useful private? :(
+    assert(params.CommandLine.Length % 2 == 0);
+    winrt::impl::hstring_builder commandline{ params.CommandLine.Length / 2u };
+    THROW_IF_WIN32_BOOL_FALSE(ReadProcessMemory(process, params.CommandLine.Buffer, commandline.data(), params.CommandLine.Length, nullptr));
+
+    return commandline.to_hstring();
+}
 
 // Notes:
 // There is a number of ways that the Conpty connection can be terminated (voluntarily or not):
@@ -276,24 +306,17 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
                                        const HANDLE hClientProcess) :
         _initialRows{ 25 },
         _initialCols{ 80 },
-        _commandline{ L"" },
-        _startingDirectory{ L"" },
-        _startingTitle{ L"" },
-        _environment{ nullptr },
-        _guid{},
-        _u8State{},
-        _u16Str{},
-        _buffer{},
         _inPipe{ hIn },
         _outPipe{ hOut }
     {
         THROW_IF_FAILED(ConptyPackPseudoConsole(hServerProcess, hRef, hSig, &_hPC));
-        if (_guid == guid{})
-        {
-            _guid = Utils::CreateGuid();
-        }
-
         _piClient.hProcess = hClientProcess;
+
+        try
+        {
+            _commandline = commandlineFromProcess(hClientProcess);
+        }
+        CATCH_LOG()
     }
 
     // Function Description:
@@ -353,6 +376,11 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
     winrt::guid ConptyConnection::Guid() const noexcept
     {
         return _guid;
+    }
+
+    winrt::hstring ConptyConnection::Commandline() const noexcept
+    {
+        return _commandline;
     }
 
     void ConptyConnection::Start()
@@ -636,8 +664,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
     HRESULT ConptyConnection::NewHandoff(HANDLE in, HANDLE out, HANDLE signal, HANDLE ref, HANDLE server, HANDLE client) noexcept
     try
     {
-        auto conn = winrt::make<implementation::ConptyConnection>(signal, in, out, ref, server, client);
-        _newConnectionHandlers(conn);
+        _newConnectionHandlers(winrt::make<ConptyConnection>(signal, in, out, ref, server, client));
 
         return S_OK;
     }
